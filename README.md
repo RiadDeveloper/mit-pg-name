@@ -9,7 +9,7 @@ The implementation involves changes across several layers of the App Inventor ar
 - **Shared Constants**: For system-wide property recognition.
 - **Client (App Engine)**: To manage the property in the project settings and designer.
 - **Server (App Engine)**: To handle serialization and persistence of project settings.
-- **Components (Runtime)**: To expose the package name via blocks.
+- **Components (Runtime)**: To expose the package name via blocks and fix screen switching logic.
 - **Build Server**: To integrate the custom package name into the final `AndroidManifest.xml`.
 - **Documentation**: To update the component reference.
 
@@ -68,22 +68,14 @@ The implementation involves changes across several layers of the App Inventor ar
 
 ---
 
-### C. Server-Side Persistence
+### C. Server-Side Persistence & Lifecycle
 #### `appinventor/appengine/src/com/google/appinventor/server/project/youngandroid/YoungAndroidSettingsBuilder.java`
 - **Change**: 
-  - Added `packageName` field.
-  - Updated constructors to read from `Settings` and `Properties`.
-  - Updated `build()` to include the package name in JSON output.
-  - Updated `toProperties()` to include the package name in `.properties` output.
-  - Added missing static import to fix build errors.
+  - Added `packageName` field and `getPackageName()` getter.
+  - Updated `toProperties()` with fallback logic for export.
 - **Code**:
   ```java
-  public String getPackageName() {
-    return packageName;
-  }
-
   public String toProperties() {
-    Properties result = new Properties();
     // ...
     String pkgNameToWrite = packageName;
     if (pkgNameToWrite == null || pkgNameToWrite.isEmpty()) {
@@ -98,160 +90,71 @@ The implementation involves changes across several layers of the App Inventor ar
   }
   ```
 
+#### `appinventor/appengine/src/com/google/appinventor/server/project/youngandroid/YoungAndroidProjectService.java`
+- **Change**: 
+  - Updated `storeProjectSettings` to prevent wiping out existing package names.
+  - Updated `newProject` to set the initial package name.
+  - Updated `getInitialFormPropertiesFileContents` to include `PackageName` in the initial `.scm`.
+- **Code (Gating)**:
+  ```java
+  if (newProperties.getPackageName().isEmpty()) {
+    newProperties.setPackageName(properties.getProperty("packagename", ""));
+  }
+  ```
+
 ---
 
 ### D. Build Server Logic
 #### `appinventor/buildserver/src/com/google/appinventor/buildserver/Project.java`
-- **Change**: 
-  - Defined `PACKAGENAME_TAG = "packagename"`.
-  - Added `getPackageName()` and `setPackageName(String packageName)` methods.
-- **Code**:
-  ```java
-  public String getPackageName() {
-    return packageName;
-  }
-
-  public void setPackageName(String packageName) {
-    this.packageName = packageName;
-  }
-  ```
+- **Change**: Added `packageName` field and getters/setters.
 
 #### `appinventor/buildserver/src/com/google/appinventor/buildserver/tasks/android/CreateManifest.java`
-- **Change**: 
-  - Extracted `packageName` from the project settings.
-  - Defined `mainactivityformClassName` using `Signatures.getPackageName(mainClass)`.
-  - Updated the `<manifest>` tag to use the custom `packageName`.
-  - Fully qualified the `mainactivity` name in the manifest (e.g., `android:name="com.example.app.Screen1"`) to ensure the app starts correctly regardless of the package name.
-- **Code**:
-  ```java
-  String packageName = project.getPackageName();
-  // ...
-  out.write("  package=\"" + packageName + "\"\n");
-  // ...
-  out.write("    <activity android:name=\"" + mainactivityformClassName + "\"\n");
-  ```
+- **Change**: Updated `<manifest>` tag to use the custom package name while qualifying activity names.
 
 ---
 
-### E. Component Runtime & Versioning
+### E. Component Runtime & Screen Switching
 #### `appinventor/components/src/com/google/appinventor/components/runtime/Form.java`
-- **Change**: 
-  - Added `PackageName(String packageName)` setter with `@DesignerProperty` and `@SimpleProperty`.
-  - Added `PackageName()` getter to return the runtime package name.
-  - Fixed an initial category error (switched from `APPEARANCE` to `GENERAL` to ensure consistency).
-- **Code**:
+- **Change**:
+  - Added `PackageName` designer property.
+  - **CRITICAL FIX**: Updated `switchForm`, `switchFormWithStartValue`, and `startNewForm` to support screen switching when a custom package name is used.
+- **Code (Screen Switching Fix)**:
   ```java
-  @DesignerProperty(editorType = PropertyTypeConstants.PROPERTY_TYPE_STRING,
-      defaultValue = "")
-  @SimpleProperty(userVisible = false,
-      description = "This is the package name of the installed application in the phone.",
-      category = PropertyCategory.GENERAL)
-  public void PackageName(String packageName) {
-    // We don't actually need to do anything.
+  public static void switchForm(String nextFormName) {
+    if (activeForm != null) {
+      String currentClassName = activeForm.getClass().getName();
+      String nextClassName = nextFormName;
+      if (!currentClassName.startsWith(YaVersion.ACCEPTABLE_COMPANION_PACKAGE)) {
+        int lastDot = currentClassName.lastIndexOf('.');
+        if (lastDot != -1) {
+          nextClassName = currentClassName.substring(0, lastDot + 1) + nextFormName;
+        }
+      }
+      activeForm.startNewForm(nextClassName, null);
+    }
+  }
+
+  protected void startNewForm(String nextFormName, Object startupValue) {
+    Intent activityIntent = new Intent();
+    if (getPackageName().startsWith(YaVersion.ACCEPTABLE_COMPANION_PACKAGE)) {
+      activityIntent.setClassName(this, getPackageName() + "." + nextFormName);
+    } else {
+      activityIntent.setClassName(this, nextFormName);
+    }
+    // ...
+    if (nextFormName.contains(".")) {
+      this.nextFormName = nextFormName.substring(nextFormName.lastIndexOf('.') + 1);
+    } else {
+      this.nextFormName = nextFormName;
+    }
   }
   ```
 
 #### `appinventor/components/src/com/google/appinventor/common/YaVersion.java`
 - **Change**: Incremented `FORM_COMPONENT_VERSION` to **32**.
-- **Code**:
-  ```java
-  public static final int FORM_COMPONENT_VERSION = 32;
-  ```
-
-#### `appinventor/appengine/src/com/google/appinventor/client/youngandroid/YoungAndroidFormUpgrader.java`
-- **Change**: Added upgrade logic for `FORM_COMPONENT_VERSION 32` to handle existing projects.
-- **Code**:
-  ```java
-  if (version < 32) {
-    // Add PackageName property if missing
-    properties.put(SettingsConstants.YOUNG_ANDROID_SETTINGS_PACKAGE_NAME, "");
-    version = 32;
-  }
-  ```
 
 ---
 
-### F. Projects & Documentation
-#### `appinventor/aiplayapp/youngandroidproject/project.properties`
-- **Change**: Added the default package name for the AI Companion project for testing.
-  ```properties
-  packagename=com.riad.aicompanion3
-  ```
-
-#### `appinventor/docs/markdown/reference/components/userinterface.md`
-- **Change**: Added documentation for the `PackageName` property under the `Screen` component.
-
----
-
-
----
-
-## 4. Advanced Persistence & Project Lifecycle
-This section details the logic implemented to ensure the package name is correctly handled during project creation, copying, and updates.
-
-### A. Robust Project Creation & Initial State
-To ensure every project starts with a valid package name, changes were made to the project creation parameters and initial file generation.
-
-- **File**: `appinventor/appengine/src/com/google/appinventor/shared/rpc/project/youngandroid/NewYoungAndroidProjectParameters.java`
-  - **Change**: Updated `getAndroidPackageName()` to return `packageName` if `androidPackageName` is empty.
-  - **Code**:
-    ```java
-    public String getAndroidPackageName() {
-      if (androidPackageName == null || androidPackageName.isEmpty()) {
-        return packageName;
-      }
-      return androidPackageName;
-    }
-    ```
-- **File**: `appinventor/appengine/src/com/google/appinventor/server/project/youngandroid/YoungAndroidProjectService.java`
-  - **Method**: `newProject(...)`
-    - **Logic**: Explicitly sets the package name in `YoungAndroidSettingsBuilder` using the parameters provided during project creation.
-    - **Code**:
-      ```java
-      YoungAndroidSettingsBuilder builder = new YoungAndroidSettingsBuilder()
-          .setProjectName(projectName)
-          .setQualifiedFormName(qualifiedFormName)
-          .setPackageName(youngAndroidParams.getAndroidPackageName());
-      ```
-  - **Method**: `getInitialFormPropertiesFileContents(...)`
-    - **Logic**: Modified the JSON template for the initial `Screen1.scm` to include the `PackageName` property. This ensures the value is persisted at the component level from the moment the project is born.
-    - **Code**:
-      ```java
-      return "#|\n$JSON\n" +
-          "{\"authURL\":[],\"YaVersion\":\"" + YaVersion.YOUNG_ANDROID_VERSION + "\",\"Source\":\"Form\"," +
-          "\"Properties\":{\"$Name\":\"" + formName + "\",\"$Type\":\"Form\"," +
-          "\"$Version\":\"" + YaVersion.FORM_COMPONENT_VERSION + "\",\"Uuid\":\"" + 0 + "\"," +
-          "\"Title\":\"" + formName + "\",\"AppName\":\"" + appName + "\",\"PackageName\":\"" + packageName + "\"}}\n|#";
-      ```
-
-### B. Prevention of Data Loss (Server-Side Gating)
-A safeguard was added to `YoungAndroidProjectService` to prevent the package name from being wiped out by client-side updates that might not include the property.
-
-- **File**: `appinventor/appengine/src/com/google/appinventor/server/project/youngandroid/YoungAndroidProjectService.java`
-  - **Method**: `storeProjectSettings(...)`
-    - **Change**: Checks if the incoming package name is empty and, if so, preserves the existing value from the project properties.
-    - **Code**:
-      ```java
-      if (newProperties.getPackageName().isEmpty()) {
-        newProperties.setPackageName(properties.getProperty("packagename", ""));
-      }
-      ```
-
-### C. Project Copying & Persistence
-- **File**: `appinventor/appengine/src/com/google/appinventor/server/project/youngandroid/YoungAndroidProjectService.java`
-  - **Method**: `copyProject(...)`
-    - **Logic**: Extracts the `packagename` from the source project's properties and applies it to the clone via `YoungAndroidSettingsBuilder`.
-
-### D. Settings Builder Support
-- **File**: `appinventor/appengine/src/com/google/appinventor/server/project/youngandroid/YoungAndroidSettingsBuilder.java`
-  - **Changes**:
-    - Added `getPackageName()` getter method.
-    - Updated `toProperties()` with fallback logic to derive the package name from `qualifiedFormName` if it is missing during the export process.
-
----
-
-## 5. Build Summary & Final Verification
-The project maintains a stable state with **BUILD SUCCESSFUL** status. Recent fixes include:
-1.  **Getter Addition**: Added `getPackageName()` to `YoungAndroidSettingsBuilder` to support persistence logic.
-2.  **Syntax Correction**: Fixed a missing semicolon in `YoungAndroidProjectService.storeProjectSettings`.
-3.  **Property Gating**: Verified that the package name is correctly gated and preserved during various project lifecycle events.
+## 3. Build & Verification
+- **Build Status**: `BUILD SUCCESSFUL` via Ant.
+- **Stability**: Verified that screen switching works correctly in both compiled apps (with custom packages) and the companion.
